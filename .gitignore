@@ -1,0 +1,43 @@
+# Personal / private files — do not push to public repo
+ai_trainer.md
+HANDOFF.md
+
+# Claude Code local config (dev-server config, hooks, agents)
+.claude/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and dumps
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Environments and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Node (just in case dependencies get added later)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Build / output directories (none right now, but future-proofing)
+dist/
+build/
+.cache/
+
+# Python (for the dev http.server, no need to track)
+__pycache__/
+*.pyc
