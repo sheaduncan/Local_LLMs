@@ -3,13 +3,16 @@
 // Tabby, etc.). Auto-detects on common ports. No remote API calls.
 //
 // Knowledge base modes (chosen via setKbMode):
-//   full       — every lesson + glossary (~19K tokens). Best grounding.
-//                Needs a model loaded with at least 24K context.
-//   retrieve   — BM25 lexical search picks top-K lessons per question.
-//                Typically 3-6K tokens. Works on small-context models.
+//   full       — every lesson + glossary (~45K tokens after the Phase 2b
+//                content expansion). Needs a model loaded with at least 64K
+//                context to leave room for the answer.
+//   retrieve   — BM25 lexical search picks top-K lessons per question, capped
+//                by a ~6K-token budget so the KB fits comfortably in 8K-context
+//                models. Falls back to summaries if no lessons match.
 //   current    — only the lesson the user is currently viewing + glossary.
 //                Falls back to summaries if not on a lesson page.
-//   summaries  — module summaries + lesson titles + glossary (~1.5K tokens).
+//   summaries  — module summaries + lesson titles + glossary (~6K tokens
+//                with the expanded glossary).
 //   off        — no course material attached. Model answers from training only.
 
 window.CHAT = (function () {
@@ -32,12 +35,16 @@ window.CHAT = (function () {
   ];
 
   const KB_MODES = [
-    { id: "full",      label: "Full course — every lesson + glossary",     hint: "~19K tokens. Needs a model loaded with at least 24K context. Best grounding." },
-    { id: "retrieve",  label: "Smart retrieval — top 5 lessons per query", hint: "BM25 lexical search picks 3–5 relevant lessons each time. Typical 3–6K tokens. Works on small-context models." },
+    { id: "full",      label: "Full course — every lesson + glossary",     hint: "~45K tokens. Needs a model loaded with at least 64K context to leave room for the answer. Best grounding when context allows." },
+    { id: "retrieve",  label: "Smart retrieval — top lessons per query",   hint: "BM25 picks the most relevant lessons each query, capped by a ~6K-token budget. Drops lower-ranked lessons if they would exceed the cap. Works on 8K-context models." },
     { id: "current",   label: "Current lesson + glossary",                 hint: "Only the lesson you're viewing right now plus the glossary. Great for Q&A on what you're reading. Falls back to summaries if not on a lesson page." },
-    { id: "summaries", label: "Summaries + lesson titles + glossary",      hint: "Module summaries and lesson titles only — no body content. ~1.5K tokens." },
+    { id: "summaries", label: "Summaries + lesson titles + glossary",      hint: "Module summaries, lesson titles, and the full glossary — ~6K tokens." },
     { id: "off",       label: "Off — no course context",                   hint: "Model answers from its own training only. Useful for comparing what grounding adds." }
   ];
+
+  // Token budget for retrieve mode — keeps the KB comfortably inside an
+  // 8K-context model's window after subtracting system prompt, question, and answer space.
+  const RETRIEVE_TOKEN_BUDGET = 6000;
 
   // BM25 stopwords — a compact list of common English words that hurt retrieval signal.
   const STOPWORDS = new Set((
@@ -273,7 +280,19 @@ window.CHAT = (function () {
       if (!query || !query.trim()) return buildSummariesKb();
       const top = searchLessons(query, 5);
       if (top.length === 0) return buildSummariesKb();
-      return buildKbForLessons(top.map(t => t.id));
+      // Apply the token budget: take the top-ranked lesson always, then add
+      // lower-ranked lessons only while the running total stays under budget.
+      const selected = [];
+      for (const item of top) {
+        const candidate = [...selected, item.id];
+        const candidateKb = buildKbForLessons(candidate);
+        if (selected.length === 0 || estimateTokens(candidateKb) <= RETRIEVE_TOKEN_BUDGET) {
+          selected.push(item.id);
+        } else {
+          break;
+        }
+      }
+      return buildKbForLessons(selected);
     }
     return buildFullKb();
   }

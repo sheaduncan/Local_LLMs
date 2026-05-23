@@ -117,11 +117,11 @@ window.WIDGETS = (function () {
   // 2) KV CACHE calculator — context × layers × kv_heads × head_dim × bytes × 2
   // ============================================================
   const KV_PRESETS = [
-    { name: "Qwen 2.5 7B (GQA)",  layers: 28, kv_heads: 4,  head_dim: 128, ctx: 8192 },
-    { name: "Llama 3 8B (GQA)",   layers: 32, kv_heads: 8,  head_dim: 128, ctx: 8192 },
-    { name: "Llama 2 13B (MHA)",  layers: 40, kv_heads: 40, head_dim: 128, ctx: 4096 },
-    { name: "Qwen 27B (GQA)",     layers: 64, kv_heads: 4,  head_dim: 128, ctx: 32768 },
-    { name: "Llama 70B (GQA)",    layers: 80, kv_heads: 8,  head_dim: 128, ctx: 8192 }
+    { name: "Qwen 2.5 7B (GQA)",        layers: 28, kv_heads: 4,  head_dim: 128, ctx: 8192 },
+    { name: "Llama 3 8B (GQA)",         layers: 32, kv_heads: 8,  head_dim: 128, ctx: 8192 },
+    { name: "Llama 2 13B (MHA)",        layers: 40, kv_heads: 40, head_dim: 128, ctx: 4096 },
+    { name: "Qwen 3.6 27B (approx)",    layers: 64, kv_heads: 4,  head_dim: 256, ctx: 32768 },
+    { name: "Llama 70B (GQA)",          layers: 80, kv_heads: 8,  head_dim: 128, ctx: 8192 }
   ];
 
   function kvCacheCalc(root) {
@@ -185,10 +185,10 @@ window.WIDGETS = (function () {
   // ============================================================
   const QUANT_BYTES = { fp16: 2, q8: 1, q6: 0.75, q5: 0.625, q4: 0.5, q3: 0.375 };
   const VRAM_PRESETS = [
-    { name: "Qwen 7B Q4 / 16K",   params: 7,  quant: "q4", ctx: 16384, layers: 28, kvh: 4,  hdim: 128, vram: 16 },
-    { name: "Llama 13B Q4 / 8K",  params: 13, quant: "q4", ctx: 8192,  layers: 40, kvh: 40, hdim: 128, vram: 24 },
-    { name: "Qwen 27B Q4 / 32K",  params: 27, quant: "q4", ctx: 32768, layers: 64, kvh: 4,  hdim: 128, vram: 24 },
-    { name: "Llama 70B Q4 / 8K",  params: 70, quant: "q4", ctx: 8192,  layers: 80, kvh: 8,  hdim: 128, vram: 48 }
+    { name: "Qwen 7B Q4 / 16K",          params: 7,  quant: "q4", ctx: 16384, layers: 28, kvh: 4,  hdim: 128, vram: 16 },
+    { name: "Llama 13B Q4 / 8K",         params: 13, quant: "q4", ctx: 8192,  layers: 40, kvh: 40, hdim: 128, vram: 24 },
+    { name: "Qwen 3.6 27B Q4 / 32K",     params: 27, quant: "q4", ctx: 32768, layers: 64, kvh: 4,  hdim: 256, vram: 24 },
+    { name: "Llama 70B Q4 / 8K",         params: 70, quant: "q4", ctx: 8192,  layers: 80, kvh: 8,  hdim: 128, vram: 48 }
   ];
 
   function vramCalc(root) {
@@ -998,8 +998,9 @@ window.WIDGETS = (function () {
       const perSeqTps = (1 / stepTime) * SP_EFFICIENCY * state.spec;
       const batchThroughput = perSeqTps * state.batch;
 
-      // Prefill (compute-bound)
-      const prefillFlops = state.prompt * 2 * state.total * 1e9;  // dense forward FLOPs
+      // Prefill (compute-bound). For MoE, per-token FLOPs scale with active
+      // parameters (only the routed experts execute per token), not total.
+      const prefillFlops = state.prompt * 2 * state.active * 1e9;  // dense forward FLOPs through active path
       const ttftSec = prefillFlops / (state.flops * 1e12 * SP_COMPUTE_UTIL);
 
       // Per-request total time (single sequence in batch)
@@ -1010,24 +1011,32 @@ window.WIDGETS = (function () {
       const bandwidthBound = bwTimePerStep >= computeTimePerStep;
       const bottleneck = bandwidthBound ? "Bandwidth-bound" : "Compute-bound";
       const bottleneckExplain = bandwidthBound
-        ? `At batch ${state.batch}, the GPU finishes reading weights (${activeWeightGB.toFixed(2)} GB at ${state.bw} GB/s = ${(bwTimePerStep*1000).toFixed(2)} ms/step) before it finishes the math. More memory bandwidth helps directly. More FLOPs do not — until you raise the batch.`
+        ? `At batch ${state.batch}, the math (${(computeTimePerStep*1000).toFixed(2)} ms/step) finishes before the weight read does (${activeWeightGB.toFixed(2)} GB at ${state.bw} GB/s = ${(bwTimePerStep*1000).toFixed(2)} ms/step), so compute stalls waiting on memory. More memory bandwidth helps directly. More FLOPs do not — until batch grows enough to flip the balance.`
         : `At batch ${state.batch}, compute is the bottleneck (${(computeTimePerStep*1000).toFixed(2)} ms/step vs ${(bwTimePerStep*1000).toFixed(2)} ms for bandwidth). More FLOPs help, lower batch helps single-sequence latency, higher batch helps throughput.`;
 
       // Bandwidth saturation batch
       const saturationBatch = Math.max(1, Math.floor(bwTimePerStep / (computeFlopsPerSeqStep / (state.flops * 1e12 * SP_COMPUTE_UTIL))));
 
-      // VRAM check
+      // VRAM check — includes a rough KV cache estimate. The widget does not
+      // expose layer / KV-head detail, so this uses a heuristic calibrated to
+      // typical 2026 GQA models: ~0.04 MB/token per sqrt(B) of total params at
+      // FP16 KV. Approximates Llama-3 8B at ~0.11 MB/tok and Llama 70B at
+      // ~0.33 MB/tok. MoE total drives the KV layout, not active.
       const overhead = 1.5; // GB
-      const totalMem = weightGB + overhead;
+      const kvBytesPerToken = 40000 * Math.sqrt(state.total);
+      const kvCacheGB = state.batch * (state.prompt + state.gen) * kvBytesPerToken / 1e9;
+      const totalMem = weightGB + overhead + kvCacheGB;
       const fitsVram = totalMem < state.vram * 0.9;
       const vramRow = `<tr><th>Weight memory</th><td>${weightGB.toFixed(2)} GB ${state.total !== state.active ? `(MoE — ${activeWeightGB.toFixed(2)} GB active per token)` : ""}</td></tr>`;
+      const kvRow = `<tr><th>KV cache (approx, FP16)</th><td>${kvCacheGB.toFixed(2)} GB at ${state.prompt}+${state.gen} tokens × batch ${state.batch}</td></tr>`;
       const vramVerdict = fitsVram
         ? ""
-        : `<div class="verdict bad">Weights (${weightGB.toFixed(1)} GB) plus overhead exceed ~90% of ${state.vram} GB VRAM. Real-world speed will be much worse — CPU spill or OOM.</div>`;
+        : `<div class="verdict bad">Weights (${weightGB.toFixed(1)} GB) + KV cache (${kvCacheGB.toFixed(1)} GB) + overhead exceeds ~90% of ${state.vram} GB VRAM. Expect CPU spill or OOM at this configuration — reduce context, batch, or model size.</div>`;
 
       $("#sp-out").innerHTML = `
         <table>
           ${vramRow}
+          ${kvRow}
           <tr><th>Decode rate (per sequence)</th><td><strong>${perSeqTps.toFixed(1)} tok/sec</strong></td></tr>
           <tr><th>Batch throughput</th><td>${batchThroughput.toFixed(0)} tok/sec across ${state.batch} sequence${state.batch===1?"":"s"}</td></tr>
           <tr><th>Time to first token</th><td>${fmtMs(ttftSec)} (prefill of ${state.prompt} tokens)</td></tr>
@@ -1780,7 +1789,7 @@ for model of ["qwen3-coder-30b", "deepseek-coder-33b"] {
       embed:       { primary: "ONNX Runtime GenAI", alts: ["llama.cpp"], why: "App embedding wants a portable runtime, not a server. ONNX Runtime gives you CUDA + DirectML + TensorRT paths in one binary." }
     },
     multiRtx: {
-      convenience: { primary: "ExLlamaV3", alts: ["llama.cpp (NOT multi-GPU)", "vLLM"], why: "ExLlamaV3 extends V2 with tensor-parallel and expert-parallel inference for consumer multi-GPU. EXL3 quantization, OpenAI-compat via TabbyAPI. llama.cpp is explicitly NOT designed for multi-GPU." },
+      convenience: { primary: "ExLlamaV3", alts: ["llama.cpp (layer-split multi-GPU)", "vLLM"], why: "ExLlamaV3 extends V2 with tensor-parallel and expert-parallel inference for consumer multi-GPU, EXL3 quantization, and OpenAI-compatible serving via TabbyAPI. Check model compatibility before committing — TP/EP coverage varies by family, and some recent architectures (Qwen3-Next, Qwen3.5, Gemma4) are documented as having rougher edges. llama.cpp does support multi-GPU through --split-mode (layer-split is the default) and --tensor-split, but is less optimized than ExLlamaV3 or vLLM for consumer-grade multi-GPU serving." },
       agent:       { primary: "ExLlamaV3 / vLLM", alts: ["SGLang"], why: "Multi-GPU agents benefit from real parallelism. ExLlamaV3 for local MoE; vLLM/SGLang when behaviour under concurrent agents matters." },
       team:        { primary: "vLLM", alts: ["SGLang"], why: "Continuous batching across multiple GPUs is exactly what vLLM is built for. Without NVLink, vLLM docs note pipeline parallelism may beat tensor parallelism." },
       scale:       { primary: "vLLM or SGLang", alts: ["benchmark TensorRT-LLM"], why: "Multi-RTX scale serving wants a real engine. SGLang for structured outputs, long context, MoE, or routing." },
